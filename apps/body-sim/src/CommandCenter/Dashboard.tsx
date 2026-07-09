@@ -21,6 +21,7 @@ export default function Dashboard() {
   const smell = useBodyOS((s) => s.smell);
   const joints = useBodyOS((s) => s.joints);
   const tiltDeg = useBodyOS((s) => s.tiltDeg);
+  const balance = useBodyOS((s) => s.balance);
   const decision = useBodyOS((s) => s.lastDecision);
   const logs = useBodyOS((s) => s.logs);
 
@@ -69,13 +70,21 @@ export default function Dashboard() {
         )}
       </div>
 
-      <div style={{ ...panelStyle, maxHeight: 140 }}>
-        <div style={{ color: "#8a93a8", marginBottom: 4 }}>SENSORS</div>
+      <div style={{ ...panelStyle, maxHeight: 190 }}>
+        <div style={{ color: "#8a93a8", marginBottom: 4 }}>SENSORS / BALANCE</div>
         <div>tilt: {tiltDeg.toFixed(1)}°</div>
         <div>vision: {vision.length ? vision.map((v) => `${v.label}@${v.distance_m}m`).join(", ") : "clear"}</div>
         <div>touch: {touch.length ? touch.map((t) => `${t.body_part}<-${t.object_id}(${t.impact_force_n.toFixed(0)}N)`).join(", ") : "none"}</div>
         <div>smell: {smell.length ? smell.map((s) => `${s.label}:${s.voc_ppm}ppm`).join(", ") : "none"}</div>
         <div>joints: {joints.length ? joints.map((j) => `${j.name}:${j.angle_deg.toFixed(0)}°`).join(", ") : "n/a"}</div>
+        {balance && (
+          <div style={{ marginTop: 6 }}>
+            <div>COM: x={balance.com.x.toFixed(3)} z={balance.com.z.toFixed(3)}</div>
+            <div>Capture Point: x={balance.capturePoint.x.toFixed(3)} z={balance.capturePoint.z.toFixed(3)}</div>
+            <div>CP margin: {balance.cpMarginM.toFixed(3)}m {balance.cpInsideSupport ? "inside" : "outside"}</div>
+            <div>Support: x[{balance.support.minX.toFixed(2)}, {balance.support.maxX.toFixed(2)}] z[{balance.support.minZ.toFixed(2)}, {balance.support.maxZ.toFixed(2)}]</div>
+          </div>
+        )}
       </div>
 
       <div style={{ ...panelStyle, flex: 1 }}>
