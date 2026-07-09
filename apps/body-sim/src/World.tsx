@@ -61,8 +61,8 @@ function SceneLoop() {
 
     const { position: torsoPosVec, quaternion: quat, velocity: velVec } = handle.getTransform();
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
-    const euler = new THREE.Euler().setFromQuaternion(quat, "XYZ");
-    const tiltDeg = THREE.MathUtils.radToDeg(Math.abs(euler.x) + Math.abs(euler.z));
+    const balance = handle.getBalanceSnapshot();
+    const tiltDeg = balance?.tiltDeg ?? 0;
 
     const taggedObjects = scene.children.filter((c) => c.userData?.sensorId);
     const headWorld = torsoPosVec.clone().add(new THREE.Vector3(0, 0.6, 0));
@@ -75,7 +75,7 @@ function SceneLoop() {
     const joints = handle.getJointStates();
     const touch = touchBuffer.current.splice(0, touchBuffer.current.length);
 
-    setSensors({ vision, touch, smell, joints, tiltDeg });
+    setSensors({ vision, touch, smell, joints, tiltDeg, balance });
     tickCount.current += 1;
     incrementTick();
 
@@ -115,7 +115,7 @@ function SceneLoop() {
       <TaggedBox id="wall_n" label="wall" position={[0, 1.5, -8]} color="#3a3f4d" size={[10, 3, 0.3]} />
       <TaggedBox id="crate" label="crate" position={[1.5, 0.4, -3]} color="#8a6d3b" size={[0.8, 0.8, 0.8]} />
 
-      <Humanoid ref={humanoidRef} position={[0, 1.2, 3]} />
+      <Humanoid ref={humanoidRef} position={[0, 1.0, 3]} />
     </group>
   );
 }
