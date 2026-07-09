@@ -1,0 +1,22 @@
+services:
+  brain-api:
+    build: ./apps/brain-api
+    ports:
+      - "8000:8000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./ai_body_os.db}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+    volumes:
+      - brain_data:/app
+
+  body-sim:
+    build: ./apps/body-sim
+    ports:
+      - "5173:80"
+    depends_on:
+      - brain-api
+
+volumes:
+  brain_data:
