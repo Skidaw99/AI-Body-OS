@@ -1,176 +1,232 @@
-import { useRef, forwardRef, useImperativeHandle } from "react";
+import { forwardRef, useImperativeHandle, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
-import { RigidBody, RapierRigidBody } from "@react-three/rapier";
+import { CuboidCollider, RigidBody, RapierRigidBody } from "@react-three/rapier";
 import { ActiveCollisionTypes } from "@dimforge/rapier3d-compat";
 import * as THREE from "three";
 
+import {
+  CapturePointMetrics,
+  computeCapturePointControl,
+  computeSupportPolygon,
+  supportMargin,
+  tiltDegreesFromQuaternion,
+} from "../Balance/capturePoint";
+
 /**
- * PHASE: kinematic stance controller (chosen explicitly: "stand
- * reliably first, looks later").
+ * Dynamic biped stance body.
  *
- * Honest architecture note: true dynamic joint-driven bipedal balance
- * was tested in this session (headless Rapier, real physics) and
- * confirmed to fail even at extreme motor stiffness — the rig tumbled
- * up to 215deg tilt with no world-frame corrective feedback. That's a
- * genuine control-systems R&D problem (what Boston Dynamics solves
- * with active balance control), not a quick fix.
+ * This is intentionally NOT kinematic: the root is a dynamic Rapier rigid
+ * body with gravity, broad foot contact colliders, friction, COM tracking,
+ * support-polygon calculation, and a Capture Point / LIPM controller.
  *
- * This rig is instead KINEMATIC: no gravity acts on it, its pose is
- * fully computed from brain-controlled state every frame. This is the
- * same technique production engines (Unity/Unreal/Isaac Sim character
- * controllers) use for controllable legged/wheeled characters —
- * dynamic ragdoll physics is reserved for reactions (falling, getting
- * hit), not baseline locomotion. It stands by construction. It does
- * NOT simulate falling, tripping, or being pushed — that's out of
- * scope until an active balance controller is built on top of this.
- *
- * Touch/collision sensing still works: Rapier kinematic bodies still
- * generate real collision events against dynamic/fixed geometry
- * (verified headlessly alongside this change).
+ * Scope boundary: this is a stance controller for standing and rejecting a
+ * light disturbance. It is not a walking controller and not a hard-push
+ * recovery system. The current body is a dynamic compound stance model
+ * rather than a full articulated ankle/knee/hip actuator stack; that is the
+ * next mechanical-control layer if/when walking is required.
  */
 
-const HALF = {
-  torso: [0.25, 0.45, 0.15] as [number, number, number],
-  head: 0.22,
-  arm: [0.09, 0.275] as [number, number],
-  leg: [0.11, 0.325] as [number, number],
-};
-
-const ANCHORS = {
-  neck: [0, 0.55, 0],
-  shoulder_l: [-0.4, 0.3, 0],
-  shoulder_r: [0.4, 0.3, 0],
-  hip_l: [-0.2, -0.55, 0],
-  hip_r: [0.2, -0.55, 0],
-} as const;
-
-const VELOCITY_DAMPING = 0.9;
-
 export type JointState = { name: string; angle_deg: number; angular_velocity_deg_s: number };
+
+export type BalanceSnapshot = CapturePointMetrics & {
+  tiltDeg: number;
+  controllerEnabled: boolean;
+};
 
 export type HumanoidHandle = {
   getTransform: () => { position: THREE.Vector3; quaternion: THREE.Quaternion; velocity: THREE.Vector3 };
   getJointStates: () => JointState[];
+  getBalanceSnapshot: () => BalanceSnapshot | null;
   setJointTargetDeg: (name: string, angleDeg: number) => void;
   applyVelocityImpulse: (impulse: { x: number; y: number; z: number }) => void;
   halt: () => void;
 };
 
-type JointName = keyof typeof ANCHORS;
-const JOINT_NAMES = Object.keys(ANCHORS) as JointName[];
+const JOINT_NAMES = ["neck", "shoulder_l", "shoulder_r", "hip_l", "hip_r", "ankle_l", "ankle_r"] as const;
+type JointName = (typeof JOINT_NAMES)[number];
 
-export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number, number] }>(
-  function Humanoid({ position = [0, 1.2, 0] }, exposedRef) {
-    const torsoBody = useRef<RapierRigidBody | null>(null);
-    const headBody = useRef<RapierRigidBody | null>(null);
-    const armLBody = useRef<RapierRigidBody | null>(null);
-    const armRBody = useRef<RapierRigidBody | null>(null);
-    const legLBody = useRef<RapierRigidBody | null>(null);
-    const legRBody = useRef<RapierRigidBody | null>(null);
+const CONTROLLER = {
+  captureGain: 1.0,
+  maxHorizontalAcceleration: 4.5,
+  supportMarginM: 0.04,
+  postureStiffness: 220,
+  postureDamping: 50,
+};
 
-    const limbBodies: Record<JointName, React.RefObject<RapierRigidBody | null>> = {
-      neck: headBody, shoulder_l: armLBody, shoulder_r: armRBody, hip_l: legLBody, hip_r: legRBody,
-    };
+function vectorFromRapier(v: { x: number; y: number; z: number }) {
+  return new THREE.Vector3(v.x, v.y, v.z);
+}
 
-    // Source-of-truth kinematic state, mutated without triggering re-render.
-    const torsoPos = useRef(new THREE.Vector3(...position));
-    const torsoQuat = useRef(new THREE.Quaternion());
-    const torsoVel = useRef(new THREE.Vector3(0, 0, 0));
-    const jointAngleDeg = useRef<Record<JointName, number>>({
-      neck: 0, shoulder_l: 0, shoulder_r: 0, hip_l: 0, hip_r: 0,
+function quaternionFromRapier(q: { x: number; y: number; z: number; w: number }) {
+  return new THREE.Quaternion(q.x, q.y, q.z, q.w);
+}
+
+export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number, number]; controllerEnabled?: boolean }>(
+  function Humanoid({ position = [0, 1.0, 3], controllerEnabled = true }, exposedRef) {
+    const bodyRef = useRef<RapierRigidBody | null>(null);
+    const latestBalance = useRef<BalanceSnapshot | null>(null);
+    const virtualJointTargets = useRef<Record<JointName, number>>({
+      neck: 0,
+      shoulder_l: 0,
+      shoulder_r: 0,
+      hip_l: 0,
+      hip_r: 0,
+      ankle_l: 0,
+      ankle_r: 0,
     });
 
-    useFrame((_, delta) => {
-      torsoPos.current.addScaledVector(torsoVel.current, delta);
-      torsoVel.current.multiplyScalar(VELOCITY_DAMPING);
+    useFrame(() => {
+      const body = bodyRef.current;
+      if (!body) return;
 
-      torsoBody.current?.setNextKinematicTranslation(torsoPos.current);
-      torsoBody.current?.setNextKinematicRotation(torsoQuat.current);
+      const rootPosition = vectorFromRapier(body.translation());
+      const rootQuaternion = quaternionFromRapier(body.rotation());
+      const velocity = vectorFromRapier(body.linvel());
+      const angularVelocity = vectorFromRapier(body.angvel());
+      const com = vectorFromRapier(body.worldCom());
+      const massKg = Math.max(1, body.mass());
 
-      JOINT_NAMES.forEach((name) => {
-        const body = limbBodies[name].current;
-        if (!body) return;
-        const anchor = new THREE.Vector3(...ANCHORS[name]);
-        const worldAnchor = anchor.clone().applyQuaternion(torsoQuat.current).add(torsoPos.current);
-        const hingeQuat = new THREE.Quaternion().setFromAxisAngle(
-          new THREE.Vector3(1, 0, 0),
-          THREE.MathUtils.degToRad(jointAngleDeg.current[name])
-        );
-        const limbQuat = torsoQuat.current.clone().multiply(hingeQuat);
-        body.setNextKinematicTranslation(worldAnchor);
-        body.setNextKinematicRotation(limbQuat);
+      const control = computeCapturePointControl({
+        com,
+        velocity,
+        rootPosition,
+        rootQuaternion,
+        angularVelocity,
+        config: { massKg, ...CONTROLLER },
       });
+
+      if (controllerEnabled) {
+        body.addForce(control.force, true);
+        body.addTorque(control.torque, true);
+      }
+
+      latestBalance.current = {
+        ...control.metrics,
+        tiltDeg: tiltDegreesFromQuaternion(rootQuaternion),
+        controllerEnabled,
+      };
     });
 
     useImperativeHandle(
       exposedRef,
       (): HumanoidHandle => ({
-        getTransform: () => ({
-          position: torsoPos.current.clone(),
-          quaternion: torsoQuat.current.clone(),
-          velocity: torsoVel.current.clone(),
-        }),
+        getTransform: () => {
+          const body = bodyRef.current;
+          if (!body) {
+            return {
+              position: new THREE.Vector3(...position),
+              quaternion: new THREE.Quaternion(),
+              velocity: new THREE.Vector3(),
+            };
+          }
+          return {
+            position: vectorFromRapier(body.translation()),
+            quaternion: quaternionFromRapier(body.rotation()),
+            velocity: vectorFromRapier(body.linvel()),
+          };
+        },
         getJointStates: () =>
           JOINT_NAMES.map((name) => ({
             name,
-            angle_deg: jointAngleDeg.current[name],
+            angle_deg: virtualJointTargets.current[name],
             angular_velocity_deg_s: 0,
           })),
+        getBalanceSnapshot: () => {
+          if (latestBalance.current) return latestBalance.current;
+          const body = bodyRef.current;
+          if (!body) return null;
+          const rootPosition = vectorFromRapier(body.translation());
+          const rootQuaternion = quaternionFromRapier(body.rotation());
+          const com = vectorFromRapier(body.worldCom());
+          const velocity = vectorFromRapier(body.linvel());
+          const support = computeSupportPolygon(rootPosition, rootQuaternion);
+          const omega = Math.sqrt(9.81 / Math.max(0.4, com.y));
+          const capturePoint = { x: com.x + velocity.x / omega, z: com.z + velocity.z / omega };
+          const cpMarginM = supportMargin(capturePoint, support);
+          return {
+            com: { x: com.x, y: com.y, z: com.z },
+            velocity: { x: velocity.x, y: velocity.y, z: velocity.z },
+            capturePoint,
+            support,
+            supportCenter: { x: (support.minX + support.maxX) / 2, z: (support.minZ + support.maxZ) / 2 },
+            zmpTarget: capturePoint,
+            cpMarginM,
+            cpInsideSupport: cpMarginM >= 0,
+            omega,
+            desiredAcceleration: { x: 0, z: 0 },
+            tiltDeg: tiltDegreesFromQuaternion(rootQuaternion),
+            controllerEnabled,
+          };
+        },
         setJointTargetDeg: (name, angleDeg) => {
-          if ((JOINT_NAMES as string[]).includes(name)) jointAngleDeg.current[name as JointName] = angleDeg;
+          if ((JOINT_NAMES as readonly string[]).includes(name)) virtualJointTargets.current[name as JointName] = angleDeg;
         },
         applyVelocityImpulse: (impulse) => {
-          torsoVel.current.add(new THREE.Vector3(impulse.x, impulse.y, impulse.z));
+          bodyRef.current?.applyImpulse({ x: impulse.x, y: impulse.y, z: impulse.z }, true);
         },
         halt: () => {
-          torsoVel.current.set(0, 0, 0);
+          bodyRef.current?.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          bodyRef.current?.setAngvel({ x: 0, y: 0, z: 0 }, true);
         },
       }),
-      []
+      [controllerEnabled, position],
     );
 
     return (
-      <>
-        <RigidBody ref={torsoBody} type="kinematicPosition" colliders="cuboid" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow>
-            <boxGeometry args={[HALF.torso[0] * 2, HALF.torso[1] * 2, HALF.torso[2] * 2]} />
-            <meshStandardMaterial color="#3b6ea5" />
-          </mesh>
-        </RigidBody>
+      <RigidBody
+        ref={bodyRef}
+        type="dynamic"
+        colliders={false}
+        position={position}
+        canSleep={false}
+        linearDamping={0.08}
+        angularDamping={0.18}
+        additionalSolverIterations={12}
+      >
+        {/* Physical colliders: broad feet are real contact surfaces, not visual-only meshes. */}
+        <CuboidCollider args={[0.22, 0.55, 0.12]} position={[0, 0.35, 0]} friction={1.3} density={650} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.16, 0.16, 0.16]} position={[0, 0.95, 0]} friction={1.0} density={300} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.08, 0.35, 0.08]} position={[-0.42, 0.25, 0]} friction={1.0} density={300} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.08, 0.35, 0.08]} position={[0.42, 0.25, 0]} friction={1.0} density={300} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.12, 0.4, 0.09]} position={[-0.16, -0.35, 0]} friction={1.1} density={500} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.12, 0.4, 0.09]} position={[0.16, -0.35, 0]} friction={1.1} density={500} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.16, 0.055, 0.34]} position={[-0.16, -0.78, 0]} friction={1.35} density={900} activeCollisionTypes={ActiveCollisionTypes.ALL} />
+        <CuboidCollider args={[0.16, 0.055, 0.34]} position={[0.16, -0.78, 0]} friction={1.35} density={900} activeCollisionTypes={ActiveCollisionTypes.ALL} />
 
-        <RigidBody ref={headBody} type="kinematicPosition" colliders="ball" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow>
-            <sphereGeometry args={[HALF.head, 16, 16]} />
-            <meshStandardMaterial color="#e8b894" />
-          </mesh>
-        </RigidBody>
-
-        <RigidBody ref={armLBody} type="kinematicPosition" colliders="hull" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
-            <capsuleGeometry args={[HALF.arm[0], HALF.arm[1] * 2, 4, 8]} />
-            <meshStandardMaterial color="#e8b894" />
-          </mesh>
-        </RigidBody>
-        <RigidBody ref={armRBody} type="kinematicPosition" colliders="hull" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
-            <capsuleGeometry args={[HALF.arm[0], HALF.arm[1] * 2, 4, 8]} />
-            <meshStandardMaterial color="#e8b894" />
-          </mesh>
-        </RigidBody>
-
-        <RigidBody ref={legLBody} type="kinematicPosition" colliders="hull" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow>
-            <capsuleGeometry args={[HALF.leg[0], HALF.leg[1] * 2, 4, 8]} />
-            <meshStandardMaterial color="#2b2b3a" />
-          </mesh>
-        </RigidBody>
-        <RigidBody ref={legRBody} type="kinematicPosition" colliders="hull" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position}>
-          <mesh castShadow>
-            <capsuleGeometry args={[HALF.leg[0], HALF.leg[1] * 2, 4, 8]} />
-            <meshStandardMaterial color="#2b2b3a" />
-          </mesh>
-        </RigidBody>
-      </>
+        {/* Visual body follows the same dynamic root; these are not physics authority. */}
+        <mesh castShadow position={[0, 0.35, 0]}>
+          <boxGeometry args={[0.44, 1.1, 0.24]} />
+          <meshStandardMaterial color="#3b6ea5" />
+        </mesh>
+        <mesh castShadow position={[0, 0.95, 0]}>
+          <boxGeometry args={[0.32, 0.32, 0.32]} />
+          <meshStandardMaterial color="#e8b894" />
+        </mesh>
+        <mesh castShadow position={[-0.42, 0.25, 0]}>
+          <boxGeometry args={[0.16, 0.7, 0.16]} />
+          <meshStandardMaterial color="#e8b894" />
+        </mesh>
+        <mesh castShadow position={[0.42, 0.25, 0]}>
+          <boxGeometry args={[0.16, 0.7, 0.16]} />
+          <meshStandardMaterial color="#e8b894" />
+        </mesh>
+        <mesh castShadow position={[-0.16, -0.35, 0]}>
+          <boxGeometry args={[0.24, 0.8, 0.18]} />
+          <meshStandardMaterial color="#2b2b3a" />
+        </mesh>
+        <mesh castShadow position={[0.16, -0.35, 0]}>
+          <boxGeometry args={[0.24, 0.8, 0.18]} />
+          <meshStandardMaterial color="#2b2b3a" />
+        </mesh>
+        <mesh castShadow position={[-0.16, -0.78, 0]}>
+          <boxGeometry args={[0.32, 0.11, 0.68]} />
+          <meshStandardMaterial color="#111722" />
+        </mesh>
+        <mesh castShadow position={[0.16, -0.78, 0]}>
+          <boxGeometry args={[0.32, 0.11, 0.68]} />
+          <meshStandardMaterial color="#111722" />
+        </mesh>
+      </RigidBody>
     );
-  }
+  },
 );
