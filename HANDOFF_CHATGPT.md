@@ -137,13 +137,19 @@ silent no-op. Gefixt door namen te matchen op de echte rig.
   (vergelijkbaar met wat Boston Dynamics oplost voor Atlas) — geen
   quick fix, vereist een PD-feedback-loop op wereld-oriëntatie plus
   voet/grondcontact-geometrie.
-- **Realistisch visueel model.** Huidige meshes zijn primitives
-  (box/capsule/sphere) — functioneel voor de physics/sensor-laag,
-  niet het beoogde eindresultaat. Afgesproken vervolgstap: een echt
-  gerigd GLTF humanoid/robot-model als aparte visuele laag boven de
-  bestaande kinematic joint-state (dus: skinning/animatie-laag volgt
-  dezelfde `getJointStates()`/`setJointTargetDeg()`-API die er al is
-  in `Humanoid.tsx`, niet een losstaand systeem).
+- ~~**Realistisch visueel model.**~~ GEBOUWD (juli 2026): procedureel
+  gegenereerd, echt geskind GLB-android-model
+  (`apps/body-sim/public/android.glb`, generator:
+  `tools/generate_android_glb.mjs`, zelfgemaakt dus licentievrij) +
+  futuristische omgeving. Bones dragen exact de virtuele jointnamen
+  (incl. `ankle_l/r`) en matchen de collider-layout van de dynamische
+  stance-body; het model hangt als child onder de dynamic RigidBody
+  zodat positie/tilt echte physics zijn. Geverifieerd met `verify_visual_rig.mjs`,
+  `verify_sensors_headless.mjs` en een echte headless-Chromium-run
+  (0 console errors, live sensordata). Daarbij een derde stille
+  sensorbug gevonden en gefixt: vision verzamelde tagged objects via
+  `scene.children.filter` en zag daardoor nooit iets ("clear" forever)
+  — nu `collectTaggedObjects()` met scene-traverse, zie README.
 - Lokale open-source LLM fallback (Phase 2 van het brain-router-plan
   in `brain/router.py` — becommentarieerd, niet gebouwd)
 - Auth op de API/WebSocket

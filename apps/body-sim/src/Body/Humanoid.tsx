@@ -1,7 +1,8 @@
-import { forwardRef, useImperativeHandle, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, Suspense } from "react";
 import { useFrame } from "@react-three/fiber";
 import { CuboidCollider, RigidBody, RapierRigidBody } from "@react-three/rapier";
 import { ActiveCollisionTypes } from "@dimforge/rapier3d-compat";
+import { useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 
 import {
@@ -24,6 +25,18 @@ import {
  * recovery system. The current body is a dynamic compound stance model
  * rather than a full articulated ankle/knee/hip actuator stack; that is the
  * next mechanical-control layer if/when walking is required.
+ *
+ * VISUAL LAYER: what you SEE is public/android.glb — a procedurally
+ * generated, genuinely skinned mesh (see tools/generate_android_glb.mjs,
+ * verified by verify_visual_rig.mjs) whose skeleton matches this body's
+ * collider layout and joint names. The GLB sits INSIDE the RigidBody, so
+ * its root transform follows the dynamic physics exactly (falls/tilts and
+ * all); its bones are driven every frame from the same virtual joint
+ * registers that getJointStates()/setJointTargetDeg() expose to the brain.
+ * Honest limitation (inherited from the compound-body design): the joints
+ * are virtual — moving them animates the skin but does not move the
+ * colliders, exactly as upstream's virtual joint registers moved nothing.
+ * The colliders below are the physics authority and are unchanged.
  */
 
 export type JointState = { name: string; angle_deg: number; angular_velocity_deg_s: number };
@@ -53,6 +66,8 @@ const CONTROLLER = {
   postureDamping: 50,
 };
 
+const ANDROID_GLB = "/android.glb";
+
 function vectorFromRapier(v: { x: number; y: number; z: number }) {
   return new THREE.Vector3(v.x, v.y, v.z);
 }
@@ -61,10 +76,52 @@ function quaternionFromRapier(q: { x: number; y: number; z: number; w: number })
   return new THREE.Quaternion(q.x, q.y, q.z, q.w);
 }
 
+type AndroidVisual = {
+  bones: Partial<Record<JointName, THREE.Object3D>>;
+  glowMat: THREE.MeshStandardMaterial | null;
+};
+
+/** Loads the skinned GLB and hands its joint bones to the parent's frame
+ *  loop. Mounted inside the RigidBody, so the physics root transform is
+ *  applied by rapier itself — zero drift possible. */
+function AndroidSkin({ visualRef }: { visualRef: React.MutableRefObject<AndroidVisual | null> }) {
+  const gltf = useGLTF(ANDROID_GLB);
+
+  useEffect(() => {
+    let glowMat: THREE.MeshStandardMaterial | null = null;
+    gltf.scene.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh) {
+        mesh.castShadow = true;
+        mesh.frustumCulled = false; // skinned bounds don't track bone motion
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const m of mats) {
+          if (m.name === "android_glow") glowMat = m as THREE.MeshStandardMaterial;
+        }
+      }
+    });
+    const bones: Partial<Record<JointName, THREE.Object3D>> = {};
+    for (const name of JOINT_NAMES) {
+      bones[name] = gltf.scene.getObjectByName(name) ?? undefined;
+    }
+    const missing = JOINT_NAMES.filter((n) => !bones[n]);
+    if (missing.length) console.error(`android.glb is missing joint bones: ${missing.join(", ")}`);
+    visualRef.current = { bones, glowMat };
+    return () => {
+      visualRef.current = null;
+    };
+  }, [gltf, visualRef]);
+
+  return <primitive object={gltf.scene} />;
+}
+
+useGLTF.preload(ANDROID_GLB);
+
 export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number, number]; controllerEnabled?: boolean }>(
   function Humanoid({ position = [0, 1.0, 3], controllerEnabled = true }, exposedRef) {
     const bodyRef = useRef<RapierRigidBody | null>(null);
     const latestBalance = useRef<BalanceSnapshot | null>(null);
+    const visual = useRef<AndroidVisual | null>(null);
     const virtualJointTargets = useRef<Record<JointName, number>>({
       neck: 0,
       shoulder_l: 0,
@@ -75,7 +132,7 @@ export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number,
       ankle_r: 0,
     });
 
-    useFrame(() => {
+    useFrame((state) => {
       const body = bodyRef.current;
       if (!body) return;
 
@@ -105,6 +162,22 @@ export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number,
         tiltDeg: tiltDegreesFromQuaternion(rootQuaternion),
         controllerEnabled,
       };
+
+      // Visual skeleton: bone X-rotation mirrors the virtual joint
+      // registers the brain reads/writes via the handle below. The GLB
+      // root itself is a child of the RigidBody, so position/tilt come
+      // straight from the dynamic physics.
+      const vis = visual.current;
+      if (vis) {
+        JOINT_NAMES.forEach((name) => {
+          const bone = vis.bones[name];
+          if (bone) bone.rotation.x = THREE.MathUtils.degToRad(virtualJointTargets.current[name]);
+        });
+        if (vis.glowMat) {
+          // subtle "alive" pulse on the emissive light-lines
+          vis.glowMat.emissiveIntensity = 2.1 + Math.sin(state.clock.elapsedTime * 2.4) * 0.45;
+        }
+      }
     });
 
     useImperativeHandle(
@@ -193,39 +266,13 @@ export const Humanoid = forwardRef<HumanoidHandle, { position?: [number, number,
         <CuboidCollider args={[0.16, 0.055, 0.34]} position={[-0.16, -0.78, 0]} friction={1.35} density={900} activeCollisionTypes={ActiveCollisionTypes.ALL} />
         <CuboidCollider args={[0.16, 0.055, 0.34]} position={[0.16, -0.78, 0]} friction={1.35} density={900} activeCollisionTypes={ActiveCollisionTypes.ALL} />
 
-        {/* Visual body follows the same dynamic root; these are not physics authority. */}
-        <mesh castShadow position={[0, 0.35, 0]}>
-          <boxGeometry args={[0.44, 1.1, 0.24]} />
-          <meshStandardMaterial color="#3b6ea5" />
-        </mesh>
-        <mesh castShadow position={[0, 0.95, 0]}>
-          <boxGeometry args={[0.32, 0.32, 0.32]} />
-          <meshStandardMaterial color="#e8b894" />
-        </mesh>
-        <mesh castShadow position={[-0.42, 0.25, 0]}>
-          <boxGeometry args={[0.16, 0.7, 0.16]} />
-          <meshStandardMaterial color="#e8b894" />
-        </mesh>
-        <mesh castShadow position={[0.42, 0.25, 0]}>
-          <boxGeometry args={[0.16, 0.7, 0.16]} />
-          <meshStandardMaterial color="#e8b894" />
-        </mesh>
-        <mesh castShadow position={[-0.16, -0.35, 0]}>
-          <boxGeometry args={[0.24, 0.8, 0.18]} />
-          <meshStandardMaterial color="#2b2b3a" />
-        </mesh>
-        <mesh castShadow position={[0.16, -0.35, 0]}>
-          <boxGeometry args={[0.24, 0.8, 0.18]} />
-          <meshStandardMaterial color="#2b2b3a" />
-        </mesh>
-        <mesh castShadow position={[-0.16, -0.78, 0]}>
-          <boxGeometry args={[0.32, 0.11, 0.68]} />
-          <meshStandardMaterial color="#111722" />
-        </mesh>
-        <mesh castShadow position={[0.16, -0.78, 0]}>
-          <boxGeometry args={[0.32, 0.11, 0.68]} />
-          <meshStandardMaterial color="#111722" />
-        </mesh>
+        {/* Visible layer — skinned android; follows this dynamic body's
+            transform because it is a child of it. No colliders of its own
+            (colliders={false} on the body; the explicit colliders above
+            are the physics authority). */}
+        <Suspense fallback={null}>
+          <AndroidSkin visualRef={visual} />
+        </Suspense>
       </RigidBody>
     );
   },

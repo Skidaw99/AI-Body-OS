@@ -1,14 +1,24 @@
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, ReactNode } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Physics, RigidBody } from "@react-three/rapier";
+import { Physics, RigidBody, CuboidCollider } from "@react-three/rapier";
 import { ActiveCollisionTypes } from "@dimforge/rapier3d-compat";
 import * as THREE from "three";
 
 import { Humanoid, HumanoidHandle } from "./Body/Humanoid";
 import { castVision } from "./Sensors/VisionSensor";
 import { computeSmell } from "./Sensors/SmellSensor";
+import { collectTaggedObjects } from "./Sensors/collectTagged";
 import { connectBrain, sendSensorSnapshot } from "./ws/client";
 import { useBodyOS } from "./store";
+import {
+  Atmosphere,
+  FloorSkin,
+  Perimeter,
+  TrashBinVisual,
+  PlanterVisual,
+  SciFiWallVisual,
+  CargoCrateVisual,
+} from "./Environment";
 
 const TICK_HZ = 10; // sensor snapshot rate sent to the brain (not the physics rate)
 
@@ -19,15 +29,20 @@ const VOC_SOURCES: VOCSource[] = [
   { id: "flower_pot", label: "flowers", position: [-2.5, 0.3, 1.5], strength: 8 },
 ];
 
-function TaggedBox({ id, label, position, color, size = [0.6, 0.6, 0.6] }: {
-  id: string; label: string; position: [number, number, number]; color: string; size?: [number, number, number];
+/**
+ * Sensor-tagged prop: the collider half-extents are pinned to the exact
+ * values the old auto-generated cuboid colliders had (size/2), so the
+ * touch/vision sensor behavior is unchanged while the visuals are free
+ * to be actual set-dressing instead of colored boxes.
+ */
+function TaggedProp({ id, label, position, colliderHalf, children }: {
+  id: string; label: string; position: [number, number, number];
+  colliderHalf: [number, number, number]; children: ReactNode;
 }) {
   return (
-    <RigidBody type="fixed" colliders="cuboid" activeCollisionTypes={ActiveCollisionTypes.ALL} position={position} userData={{ sensorId: id, label }}>
-      <mesh castShadow receiveShadow userData={{ sensorId: id, label }}>
-        <boxGeometry args={size} />
-        <meshStandardMaterial color={color} />
-      </mesh>
+    <RigidBody type="fixed" colliders={false} activeCollisionTypes={ActiveCollisionTypes.ALL} position={position} userData={{ sensorId: id, label }}>
+      <CuboidCollider args={colliderHalf} />
+      <group userData={{ sensorId: id, label }}>{children}</group>
     </RigidBody>
   );
 }
@@ -64,7 +79,7 @@ function SceneLoop() {
     const balance = handle.getBalanceSnapshot();
     const tiltDeg = balance?.tiltDeg ?? 0;
 
-    const taggedObjects = scene.children.filter((c) => c.userData?.sensorId);
+    const taggedObjects = collectTaggedObjects(scene);
     const headWorld = torsoPosVec.clone().add(new THREE.Vector3(0, 0.6, 0));
 
     const vision = castVision(scene, headWorld, forward, taggedObjects);
@@ -96,26 +111,44 @@ function SceneLoop() {
 
   return (
     <group>
-      <RigidBody type="fixed" activeCollisionTypes={ActiveCollisionTypes.ALL} onCollisionEnter={(e) => {
+      {/* physics ground + touch sensor. The collider is an explicit THICK
+          cuboid (top face at y=0): the old auto-collider derived from a
+          flat plane mesh had ~zero thickness, and the dynamic body's small
+          foot colliders sank straight through it until the torso collider
+          caught — the android stood buried to its waist in the browser
+          while every headless test (which models a thick ground) passed.
+          The visible futuristic floor is FloorSkin, outside this body so
+          it can't add unintended colliders. */}
+      <RigidBody type="fixed" colliders={false} activeCollisionTypes={ActiveCollisionTypes.ALL} onCollisionEnter={(e) => {
         const other = e.other.rigidBodyObject;
         if (!other) return;
         const relVel = e.other.rigidBody?.linvel();
         const speed = relVel ? Math.sqrt(relVel.x ** 2 + relVel.y ** 2 + relVel.z ** 2) : 0;
         registerTouch("body", other.userData?.sensorId ?? "unknown", speed * 40); // mass-scaled estimate
       }}>
-        <mesh receiveShadow rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[30, 30]} />
-          <meshStandardMaterial color="#1c2230" />
-        </mesh>
+        <CuboidCollider args={[15, 0.25, 15]} position={[0, -0.25, 0]} friction={1.2} />
       </RigidBody>
 
-      {VOC_SOURCES.map((v) => (
-        <TaggedBox key={v.id} id={v.id} label={v.label} position={v.position} color={v.id === "trash_bin" ? "#5a4a2a" : "#c65a9e"} />
-      ))}
-      <TaggedBox id="wall_n" label="wall" position={[0, 1.5, -8]} color="#3a3f4d" size={[10, 3, 0.3]} />
-      <TaggedBox id="crate" label="crate" position={[1.5, 0.4, -3]} color="#8a6d3b" size={[0.8, 0.8, 0.8]} />
+      {/* sensor-tagged props — same ids, positions, and collider sizes as
+          the original primitive boxes */}
+      <TaggedProp id="trash_bin" label="trash bin" position={[3, 0.3, -2]} colliderHalf={[0.3, 0.3, 0.3]}>
+        <TrashBinVisual />
+      </TaggedProp>
+      <TaggedProp id="flower_pot" label="flowers" position={[-2.5, 0.3, 1.5]} colliderHalf={[0.3, 0.3, 0.3]}>
+        <PlanterVisual />
+      </TaggedProp>
+      <TaggedProp id="wall_n" label="wall" position={[0, 1.5, -8]} colliderHalf={[5, 1.5, 0.15]}>
+        <SciFiWallVisual />
+      </TaggedProp>
+      <TaggedProp id="crate" label="crate" position={[1.5, 0.4, -3]} colliderHalf={[0.4, 0.4, 0.4]}>
+        <CargoCrateVisual />
+      </TaggedProp>
 
       <Humanoid ref={humanoidRef} position={[0, 1.0, 3]} />
+
+      {/* visual-only set dressing: no colliders, no sensor tags */}
+      <FloorSkin />
+      <Perimeter />
     </group>
   );
 }
@@ -138,8 +171,7 @@ function applyDecision(humanoid: HumanoidHandle, decision: any) {
 export default function World() {
   return (
     <Canvas shadows camera={{ position: [0, 3, 9], fov: 50 }}>
-      <ambientLight intensity={0.4} />
-      <directionalLight position={[5, 8, 5]} intensity={1.1} castShadow />
+      <Atmosphere />
       <Physics gravity={[0, -9.81, 0]}>
         <SceneLoop />
       </Physics>
