@@ -1,0 +1,12 @@
+# Normalize line endings: text files are stored with LF in the repo;
+# working-copy endings follow platform/config. Silences the LF/CRLF
+# warnings on Windows.
+* text=auto
+
+# Binary assets — never normalize
+*.glb binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.wasm binary
